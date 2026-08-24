@@ -1,5 +1,10 @@
 #pragma once
 
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include "common.h"
 
 #include "params.h"
@@ -33,13 +38,92 @@ struct DecodeImplMeta {
     int block_size_topk;
 };
 
+struct DecodeWorkload {
+    int b;
+    int s_q;
+    int h_q;
+    int d_qk;
+    int page_block_size;
+    int topk;
+    int extra_page_block_size;
+    int extra_topk;
+    bool have_topk_length;
+    bool have_extra_kcache;
+    bool have_extra_topk_length;
+};
+
 class DecodeImplBase : public ImplBase<
     SparseAttnDecodeParams,
     DecodeFeatures
 > {
 public:
-    virtual DecodeImplMeta get_meta(int h_q, int s_q) = 0;
+    virtual DecodeImplMeta get_meta(const DecodeWorkload &workload) = 0;
 };
+
+static int positive_env_or_zero(const char *name) {
+    const char *value = std::getenv(name);
+    if (!value) return 0;
+    const int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : 0;
+}
+
+static const char *workload_signature(const DecodeWorkload &w) {
+    if (!w.have_extra_kcache && w.topk == 2048) return "glm";
+    if (!w.have_extra_kcache && w.topk == 128) return "dsv4-swa";
+    if (w.have_extra_kcache && w.topk == 128 && w.extra_topk == 1024)
+        return "dsv4-c4a";
+    if (w.have_extra_kcache && w.topk == 128 && w.extra_topk == 8192)
+        return "dsv4-c128a";
+    return "other";
+}
+
+// This first table is intentionally conservative and remains tunable while
+// repeated multi-context sweeps are running.  Unsupported or high-load shapes
+// always preserve the upstream scheduler.  Final accepted values are replaced
+// only after every repeated sample is positive and the median clears the gate.
+static int dynamic_num_sm_parts(
+    const DecodeWorkload &w,
+    int upstream_num_sm_parts
+) {
+    const int query_tiles = w.b * w.s_q;
+    const char *signature = workload_signature(w);
+    int cap = upstream_num_sm_parts;
+    if (std::strcmp(signature, "glm") == 0 && w.d_qk == 576) {
+        if (w.s_q == 1 && w.b == 1) cap = 32;
+    } else if (std::strcmp(signature, "dsv4-swa") == 0) {
+        if (query_tiles == 8) cap = 32;
+        else if (query_tiles == 32) cap = 96;
+        else if (query_tiles == 64) cap = 64;
+    } else if (std::strcmp(signature, "dsv4-c128a") == 0) {
+        if (query_tiles == 8) cap = 96;
+        else if (query_tiles == 32) cap = 32;
+    }
+    return std::min(upstream_num_sm_parts, cap);
+}
+
+static int select_num_sm_parts(
+    const DecodeWorkload &w,
+    int upstream_num_sm_parts,
+    const char **policy_out
+) {
+    const char *policy = std::getenv("WS58_FLASHMLA_POLICY");
+    if (!policy || std::strcmp(policy, "dynamic") == 0) {
+        *policy_out = "dynamic";
+        return dynamic_num_sm_parts(w, upstream_num_sm_parts);
+    }
+    if (std::strcmp(policy, "baseline") == 0) {
+        *policy_out = "baseline";
+        return upstream_num_sm_parts;
+    }
+    if (std::strcmp(policy, "fixed") == 0) {
+        int cap = positive_env_or_zero("WS58_FLASHMLA_FIXED_CAP");
+        if (!cap) cap = positive_env_or_zero("WS58_C04_MAX_SM_PARTS");
+        *policy_out = "fixed";
+        return cap ? std::min(upstream_num_sm_parts, cap) : upstream_num_sm_parts;
+    }
+    *policy_out = "invalid-baseline-fallback";
+    return upstream_num_sm_parts;
+}
 
 class Decode_Sm90_Impl : public DecodeImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -56,10 +140,33 @@ class Decode_Sm90_Impl : public DecodeImplBase {
     )
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(const DecodeWorkload &w) override {
         Arch arch = Arch();
+        const int upstream_num_sm_parts =
+            std::max(arch.num_sms / w.s_q / (w.h_q / 64), 1);
+        const char *policy = nullptr;
+        const int selected_num_sm_parts =
+            select_num_sm_parts(w, upstream_num_sm_parts, &policy);
+        static std::atomic<int> log_count{0};
+        const int ticket = log_count.fetch_add(1, std::memory_order_relaxed);
+        if (ticket < 128) {
+            std::fprintf(
+                stderr,
+                "WS58_FLASHMLA_DYNAMIC_HIT policy=%s signature=%s b=%d s_q=%d "
+                "query_tiles=%d h_q=%d d_qk=%d page=%d topk=%d extra_page=%d "
+                "extra_topk=%d have_topk_length=%d have_extra_topk_length=%d "
+                "upstream=%d selected=%d\\n",
+                policy, workload_signature(w), w.b, w.s_q, w.b * w.s_q,
+                w.h_q, w.d_qk, w.page_block_size, w.topk,
+                w.extra_page_block_size, w.extra_topk,
+                static_cast<int>(w.have_topk_length),
+                static_cast<int>(w.have_extra_topk_length),
+                upstream_num_sm_parts, selected_num_sm_parts
+            );
+            std::fflush(stderr);
+        }
         return {
-            std::max(arch.num_sms / s_q / (h_q/64), 1),
+            selected_num_sm_parts,
             5,
             64
         };
@@ -89,10 +196,10 @@ class Decode_Sm100_Head64_Impl : public DecodeImplBase {
     )
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(const DecodeWorkload &w) override {
         Arch arch = Arch();
         return {
-            std::max(arch.num_sms / s_q, 1),
+            std::max(arch.num_sms / w.s_q, 1),
             5,
             64
         };
@@ -123,10 +230,10 @@ class Decode_Sm100_Head64x2_Impl : public DecodeImplBase {
     )
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(const DecodeWorkload &w) override {
         Arch arch = Arch();
         return {
-            std::max(arch.num_sms / s_q, 1),
+            std::max(arch.num_sms / w.s_q, 1),
             5,
             64
         };
@@ -165,10 +272,10 @@ class Decode_Sm100_Head128_Impl : public DecodeImplBase {
     )
 
 public:
-    DecodeImplMeta get_meta(int h_q, int s_q) override {
+    DecodeImplMeta get_meta(const DecodeWorkload &w) override {
         Arch arch = Arch();
         return {
-            std::max(arch.num_sms / s_q / 2, 1),
+            std::max(arch.num_sms / w.s_q / 2, 1),
             3,
             64
         };
@@ -389,7 +496,19 @@ sparse_attn_decode_interface(
         STD_TORCH_CHECK(false, "Unsupported architecture for sparse decode fwd");
     }
 
-    DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
+    DecodeImplMeta impl_meta = impl->get_meta({
+        b,
+        s_q,
+        h_q,
+        d_qk,
+        page_block_size,
+        topk,
+        extra_page_block_size,
+        extra_topk,
+        have_topk_length,
+        have_extra_kcache,
+        have_extra_topk_length,
+    });
 
     SparseAttnDecodeParams params = {
         b, s_q, h_q, h_kv, d_qk, d_v,
