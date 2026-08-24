@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE} AS builder
+
+WORKDIR /opt/FlashMLA
+COPY . /opt/FlashMLA
+
+RUN test -f csrc/cutlass/include/cutlass/cutlass.h \
+ && CPLUS_INCLUDE_PATH=/usr/local/cuda/targets/x86_64-linux/include/cccl \
+      FLASH_MLA_DISABLE_SM100=1 \
+      MAX_JOBS=8 \
+      NVCC_THREADS=2 \
+      python3 setup.py build_ext --inplace \
+ && mkdir -p /opt/artifacts \
+ && cp flash_mla/_flashmla_C*.so /opt/artifacts/_flashmla_C.abi3.so \
+ && sha256sum /opt/artifacts/_flashmla_C.abi3.so
+
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+ARG VLLM_FLASHMLA_PATH=/usr/local/lib/python3.12/dist-packages/vllm/_flashmla_C.abi3.so
+COPY --from=builder /opt/artifacts/_flashmla_C.abi3.so ${VLLM_FLASHMLA_PATH}
+
+RUN sha256sum ${VLLM_FLASHMLA_PATH}
+
+LABEL org.opencontainers.image.title="FlashMLA active-head optimized vLLM" \
+      org.opencontainers.image.source="local-git-repository" \
+      flashmla.upstream_commit="a8f794d1251cbfd88a5011445dd5582289c727e4" \
+      flashmla.optimization="active-head-combine,small-split-combine,active-head-split-epilogue" \
+      flashmla.experimental="true"
