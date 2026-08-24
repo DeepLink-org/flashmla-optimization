@@ -1,5 +1,6 @@
 #include "combine.h"
 
+#include <cstdlib>
 #include <math_constants.h>
 #include <cute/tensor.hpp>
 #include <cutlass/cutlass.h>
@@ -15,7 +16,7 @@ using namespace cute;
 
 namespace smxx::decode {
 
-template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS>
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int MAX_SPLITS, int NUM_THREADS, bool FAST_SMALL_SPLITS>
 __global__ void __launch_bounds__(NUM_THREADS)
 flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     // grid_shape: [batch_size, s_q, h_q/BLOCK_SIZE_M]
@@ -67,8 +68,92 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
         datas[i] = *(float4*)(oaccum_ptr + lane_idx*4 + i*128); // NOTE We don't use __ldg here since it is incompatible with PDL
     }
 
-    // Warp #i gathers LseAccum for seq #i
-    {
+    // Warp #i gathers LseAccum for seq #i.  The upstream H200 scheduler
+    // dispatches MAX_SPLITS=160 from num_sm_parts=132 even when a low-load
+    // request has at most 32 real splits.  Preserve the exact upstream path
+    // by default; the opt-in path only removes masked -inf/zero work which is
+    // never consumed when my_num_splits <= 32.
+    if constexpr (FAST_SMALL_SPLITS) {
+        if (my_num_splits <= 32) {
+            const float local_lse = lane_idx < my_num_splits
+                ? gLseAccum(lane_idx, warp_idx)
+                : -INFINITY;
+
+            float max_lse = local_lse;
+            CUTLASS_PRAGMA_UNROLL
+            for (int offset = 16; offset >= 1; offset /= 2)
+                max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
+            max_lse = max_lse == -INFINITY ? 0.0f : max_lse;
+
+            float sum_lse = exp2f(local_lse - max_lse);
+            CUTLASS_PRAGMA_UNROLL
+            for (int offset = 16; offset >= 1; offset /= 2)
+                sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
+
+            float global_lse = (sum_lse == 0.f || sum_lse == -INFINITY)
+                ? INFINITY
+                : log2f(sum_lse) + max_lse;
+            if (lane_idx == 0)
+                gLse(warp_idx) = global_lse / (float)M_LOG2E;
+
+            if (params.attn_sink != nullptr) {
+                int q_head_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
+                float attn_sink = __ldg(params.attn_sink + q_head_idx);
+                if (global_lse != INFINITY) {
+                    global_lse += log2f(1 + exp2f(attn_sink*CUDART_L2E_F - global_lse));
+                } else {
+                    global_lse = attn_sink == -INFINITY
+                        ? +INFINITY
+                        : attn_sink*CUDART_L2E_F;
+                }
+            }
+            smem_buf[warp_idx][lane_idx] = exp2f(local_lse - global_lse);
+        } else {
+            constexpr int NUM_LSE_PER_THREAD = cute::ceil_div(MAX_SPLITS, 32);
+            float local_lse[NUM_LSE_PER_THREAD];
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+                const int split_idx = i*32 + lane_idx;
+                local_lse[i] = split_idx < my_num_splits ? gLseAccum(split_idx, warp_idx) : -INFINITY;
+            }
+
+            float max_lse = -INFINITY;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+                max_lse = max(max_lse, local_lse[i]);
+            CUTLASS_PRAGMA_UNROLL
+            for (int offset = 16; offset >= 1; offset /= 2)
+                max_lse = max(max_lse, __shfl_xor_sync(uint32_t(-1), max_lse, offset));
+            max_lse = max_lse == -INFINITY ? 0.0f : max_lse;
+
+            float sum_lse = 0;
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < NUM_LSE_PER_THREAD; ++i)
+                sum_lse = sum_lse + exp2f(local_lse[i] - max_lse);
+            CUTLASS_PRAGMA_UNROLL
+            for (int offset = 16; offset >= 1; offset /= 2)
+                sum_lse = sum_lse + __shfl_xor_sync(uint32_t(-1), sum_lse, offset);
+
+            float global_lse = (sum_lse == 0.f || sum_lse == -INFINITY) ? INFINITY : log2f(sum_lse) + max_lse;
+            if (lane_idx == 0)
+                gLse(warp_idx) = global_lse / (float)M_LOG2E;
+
+            if (params.attn_sink != nullptr) {
+                int q_head_idx = h_block_idx*BLOCK_SIZE_M + warp_idx;
+                float attn_sink = __ldg(params.attn_sink + q_head_idx);
+                if (global_lse != INFINITY) {
+                    global_lse += log2f(1 + exp2f(attn_sink*CUDART_L2E_F - global_lse));
+                } else {
+                    global_lse = attn_sink == -INFINITY ? +INFINITY : attn_sink*CUDART_L2E_F;
+                }
+            }
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < NUM_LSE_PER_THREAD; ++i) {
+                const int split_idx = i*32 + lane_idx;
+                smem_buf[warp_idx][split_idx] = exp2f(local_lse[i] - global_lse);
+            }
+        }
+    } else {
         constexpr int NUM_LSE_PER_THREAD = cute::ceil_div(MAX_SPLITS, 32);
         float local_lse[NUM_LSE_PER_THREAD];
         CUTLASS_PRAGMA_UNROLL
@@ -184,29 +269,44 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
     }()
 
 
+template<typename ElementT, int HEAD_DIM_V, int BLOCK_SIZE_M, int NUM_SPLITS, bool FAST_SMALL_SPLITS>
+void launch_flash_mla_combine_kernel(CombineParams &params) {
+    constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
+    constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
+    auto combine_kernel = &flash_fwd_mla_combine_kernel<
+        ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS,
+        FAST_SMALL_SPLITS>;
+    CHECK_CUDA(cudaFuncSetAttribute(
+        combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    cudaLaunchAttribute attribute[1];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t combine_kernel_config = {
+        dim3(params.b, params.s_q, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+        dim3(NUM_THREADS, 1, 1),
+        0,
+        params.stream,
+        attribute,
+        1
+    };
+    CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+}
+
 template<typename ElementT>
 void run_flash_mla_combine_kernel(CombineParams &params) {
     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+    const char *fast_value = std::getenv("WS58_FLASHMLA_FAST_SMALL_SPLITS");
+    const bool fast_small_splits = fast_value && fast_value[0] == '1' && fast_value[1] == '\0';
     MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
         constexpr int BLOCK_SIZE_M = 8;
-        constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
-        constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
-        cudaLaunchAttribute attribute[1];
-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
-        cudaLaunchConfig_t combine_kernel_config = {
-            dim3(params.b, params.s_q, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
-            dim3(NUM_THREADS, 1, 1),
-            0,
-            params.stream,
-            attribute,
-            1
-        };
-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+        if (fast_small_splits) {
+            launch_flash_mla_combine_kernel<
+                ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, true>(params);
+        } else {
+            launch_flash_mla_combine_kernel<
+                ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, false>(params);
+        }
     });
     CHECK_CUDA_KERNEL_LAUNCH();
 }
