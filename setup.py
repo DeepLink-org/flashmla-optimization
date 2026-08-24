@@ -59,8 +59,6 @@ def get_nvcc_thread_args():
     nvcc_threads = os.getenv("NVCC_THREADS") or "32"
     return ["--threads", nvcc_threads]
 
-subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"])
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 if IS_WINDOWS:
