@@ -113,7 +113,7 @@ sha256sum flash_mla/_flashmla_C*.so
 
 ```bash
 docker build \
-  --build-arg BASE_IMAGE='registry.h.pjlab.org.cn/ailab-pj-bw_gpu/yangxiaolei@sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2' \
+  --build-arg BASE_IMAGE='registry.h.pjlab.org.cn/ailab-pj-bw_gpu/yangxiaolei:vllm-openai-v0.27.1' \
   -f docker/Dockerfile.vllm \
   -t flashmla-vllm-optimization:local \
   .
