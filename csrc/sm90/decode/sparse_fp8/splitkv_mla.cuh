@@ -83,9 +83,9 @@ __forceinline__ __device__ void scale_softmax(
         *(float2*)(sScale + 2*(idx_in_warpgroup/4)) = *(float2*)(scale_for_olds);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool ACTIVE_HEAD_EPILOGUE>
 template<typename TMAParams>
-__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
+__device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS, ACTIVE_HEAD_EPILOGUE>::devfunc(const SparseAttnDecodeParams &params, const TMAParams &tma_params) {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)) || (defined(__CLION_IDE__) || defined(__VSCODE_IDE__))
     const int head_block_idx = NUM_M_BLOCKS == 1 ? 0 : blockIdx.x;
     const int s_q_idx = blockIdx.y;
@@ -323,7 +323,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
                 rL[i] = rL[i] == 0.0f ? 1.0f : rL[i];
             
             int start_head_idx = head_block_idx*BLOCK_M;
-            int num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M);
+            int num_valid_seq_q = ACTIVE_HEAD_EPILOGUE
+                ? max(0, min(params.active_h_q - start_head_idx, BLOCK_M))
+                : min(params.h_q - start_head_idx, BLOCK_M);
             if (args.is_no_split) {
                 bf16* o_ptr = (bf16*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_h_q, 1)
                 Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
@@ -425,7 +427,9 @@ __device__ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::devfunc(const SparseAttnD
             }
                 
             int start_head_idx = head_block_idx*BLOCK_M;
-            int num_valid_seq_q = min(params.h_q - start_head_idx, BLOCK_M);
+            int num_valid_seq_q = ACTIVE_HEAD_EPILOGUE
+                ? max(0, min(params.active_h_q - start_head_idx, BLOCK_M))
+                : min(params.h_q - start_head_idx, BLOCK_M);
             if (args.is_no_split) {
                 bf16* o_ptr = (bf16*)params.out + batch_idx*params.stride_o_b + s_q_idx*params.stride_o_s_q + start_head_idx*params.stride_o_h_q;	// (BLOCK_M, HEAD_DIM_V) : (params.stride_o_h_q, 1)
                 Tensor gO = make_tensor(make_gmem_ptr(o_ptr), make_layout(
@@ -683,8 +687,8 @@ flash_fwd_splitkv_mla_fp8_sparse_kernel(__grid_constant__ const SparseAttnDecode
     Kernel::devfunc(params, tma_params);
 }
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
-void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &params) {
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool ACTIVE_HEAD_EPILOGUE>
+void KernelTemplate<MODEL_TYPE, NUM_HEADS, ACTIVE_HEAD_EPILOGUE>::run(const SparseAttnDecodeParams &params) {
     KU_ASSERT(params.h_kv == 1);
     KU_ASSERT(params.topk % TOPK_BLOCK_SIZE == 0);
     KU_ASSERT(params.d_qk == HEAD_DIM_K);
@@ -748,7 +752,7 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
         shape_Q, tma_Q,
         tensor_map_o
     };
-    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS>, decltype(tma_params)>;
+    auto mla_kernel = &flash_fwd_splitkv_mla_fp8_sparse_kernel<KernelTemplate<MODEL_TYPE, NUM_HEADS, ACTIVE_HEAD_EPILOGUE>, decltype(tma_params)>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
     KU_CUDA_CHECK(cudaFuncSetAttribute(mla_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
@@ -781,7 +785,19 @@ void KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(const SparseAttnDecodeParams &pa
 
 template<ModelType MODEL_TYPE, int NUM_HEADS>
 void run_flash_splitkv_mla_fp8_sparse_kernel(const SparseAttnDecodeParams &params) {
-    KernelTemplate<MODEL_TYPE, NUM_HEADS>::run(params);
+    // The production specialization is validated only for the Hopper h_q=64
+    // instantiation used by GLM-5.2 TP8 and DS-V4 TP8. Keep h_q=128 on the
+    // upstream template: its experimental active template spills registers
+    // and is outside this campaign's correctness/performance evidence.
+    if constexpr (NUM_HEADS == 64) {
+        if (params.active_h_q < params.h_q) {
+            KernelTemplate<MODEL_TYPE, NUM_HEADS, true>::run(params);
+        } else {
+            KernelTemplate<MODEL_TYPE, NUM_HEADS, false>::run(params);
+        }
+    } else {
+        KernelTemplate<MODEL_TYPE, NUM_HEADS, false>::run(params);
+    }
 }
 
 }

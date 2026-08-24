@@ -100,6 +100,7 @@ struct SparseAttnDecodeParams {
     DecodingSchedMeta* __restrict__ tile_scheduler_metadata_ptr; // [num_sm_parts, ], contiguous
     int* __restrict__ num_splits_ptr; // [batch_size+1, ], contiguous
     int num_sm_parts;
+    int active_h_q;  // TP-local real heads; padded h_q remains the WGMMA shape
 };
 
 struct CombineParams {

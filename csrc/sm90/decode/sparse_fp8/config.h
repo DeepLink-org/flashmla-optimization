@@ -12,7 +12,7 @@ using namespace cute;
 
 namespace sm90::decode::sparse_fp8 {
 
-template<ModelType MODEL_TYPE, int NUM_HEADS>
+template<ModelType MODEL_TYPE, int NUM_HEADS, bool ACTIVE_HEAD_EPILOGUE>
 class KernelTemplate {
 public:
 
@@ -245,10 +245,20 @@ static __forceinline__ __device__ void store_o(
         for (int idx = 0; idx < size(rO); idx += 2) {
             int row = (idx_in_warpgroup/32)*16 + (idx_in_warpgroup%32/4) + (idx%4 >= 2 ? 8 : 0);
             int col = warpgroup_idx*256 + (idx_in_warpgroup%4)*2 + idx/4*8;
-            *(float2*)(&(sOutputAccumBuf(row, col))) = float2 {
-                rO(idx) * o_scales[idx%4>=2],
-                rO(idx+1) * o_scales[idx%4>=2],
-            };
+            if constexpr (!ACTIVE_HEAD_EPILOGUE) {
+                *(float2*)(&(sOutputAccumBuf(row, col))) = float2 {
+                    rO(idx) * o_scales[idx%4>=2],
+                    rO(idx+1) * o_scales[idx%4>=2],
+                };
+            } else if (row < num_valid_seq_q) {
+                // WGMMA must retain its padded 64-row tile, but padded rows
+                // are never consumed by the active-head combine kernel. Skip
+                // their FP32 scaling and shared-memory epilogue stores.
+                *(float2*)(&(sOutputAccumBuf(row, col))) = float2 {
+                    rO(idx) * o_scales[idx%4>=2],
+                    rO(idx+1) * o_scales[idx%4>=2],
+                };
+            }
         }
         cutlass::arch::fence_view_async_shared();
         

@@ -605,6 +605,7 @@ sparse_attn_decode_interface(
     params.tile_scheduler_metadata_ptr = (DecodingSchedMeta*)tile_scheduler_metadata->data_ptr();
     params.num_splits_ptr = num_splits->mutable_data_ptr<int>();
     params.num_sm_parts = impl_meta.num_sm_parts;
+    params.active_h_q = impl_meta.active_h_q;
 
     // Allocate intermediate buffers for split-KV
     const int total_num_splits = b + impl_meta.num_sm_parts;
