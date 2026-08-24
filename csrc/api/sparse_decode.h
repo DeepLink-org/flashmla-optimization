@@ -36,6 +36,7 @@ struct DecodeImplMeta {
     int num_sm_parts;
     int fixed_overhead_num_blocks;
     int block_size_topk;
+    int active_h_q;
 };
 
 struct DecodeWorkload {
@@ -107,11 +108,13 @@ static int select_num_sm_parts(
     const char **policy_out
 ) {
     const char *policy = std::getenv("WS58_FLASHMLA_POLICY");
-    if (!policy || std::strcmp(policy, "dynamic") == 0) {
+    if (policy && (std::strcmp(policy, "dynamic") == 0 ||
+                   std::strcmp(policy, "partition-only") == 0)) {
         *policy_out = "dynamic";
         return dynamic_num_sm_parts(w, upstream_num_sm_parts);
     }
-    if (std::strcmp(policy, "baseline") == 0) {
+    if (!policy || std::strcmp(policy, "baseline") == 0 ||
+        std::strcmp(policy, "active-combine-only") == 0) {
         *policy_out = "baseline";
         return upstream_num_sm_parts;
     }
@@ -123,6 +126,24 @@ static int select_num_sm_parts(
     }
     *policy_out = "invalid-baseline-fallback";
     return upstream_num_sm_parts;
+}
+
+static int select_active_h_q(
+    const DecodeWorkload &w,
+    const char *policy
+) {
+    // The split kernel retains the padded 64/128-head ABI.  Only the generic
+    // combine kernel is allowed to skip padded heads.  Keep this opt-in because
+    // FlashMLA itself cannot infer the unpadded TP-local head count from q.
+    if (!policy || (std::strcmp(policy, "dynamic") != 0 &&
+                    std::strcmp(policy, "active-combine-only") != 0)) {
+        return w.h_q;
+    }
+    const int requested = positive_env_or_zero("WS58_FLASHMLA_ACTIVE_HEADS");
+    if (!requested || requested > w.h_q || requested % 8 != 0) {
+        return w.h_q;
+    }
+    return requested;
 }
 
 class Decode_Sm90_Impl : public DecodeImplBase {
@@ -147,6 +168,8 @@ public:
         const char *policy = nullptr;
         const int selected_num_sm_parts =
             select_num_sm_parts(w, upstream_num_sm_parts, &policy);
+        const char *requested_policy = std::getenv("WS58_FLASHMLA_POLICY");
+        const int active_h_q = select_active_h_q(w, requested_policy);
         static std::atomic<int> log_count{0};
         const int ticket = log_count.fetch_add(1, std::memory_order_relaxed);
         if (ticket < 128) {
@@ -155,20 +178,21 @@ public:
                 "WS58_FLASHMLA_DYNAMIC_HIT policy=%s signature=%s b=%d s_q=%d "
                 "query_tiles=%d h_q=%d d_qk=%d page=%d topk=%d extra_page=%d "
                 "extra_topk=%d have_topk_length=%d have_extra_topk_length=%d "
-                "upstream=%d selected=%d\\n",
+                "upstream=%d selected=%d active_h_q=%d\n",
                 policy, workload_signature(w), w.b, w.s_q, w.b * w.s_q,
                 w.h_q, w.d_qk, w.page_block_size, w.topk,
                 w.extra_page_block_size, w.extra_topk,
                 static_cast<int>(w.have_topk_length),
                 static_cast<int>(w.have_extra_topk_length),
-                upstream_num_sm_parts, selected_num_sm_parts
+                upstream_num_sm_parts, selected_num_sm_parts, active_h_q
             );
             std::fflush(stderr);
         }
         return {
             selected_num_sm_parts,
             5,
-            64
+            64,
+            active_h_q
         };
     }
 
@@ -201,7 +225,8 @@ public:
         return {
             std::max(arch.num_sms / w.s_q, 1),
             5,
-            64
+            64,
+            w.h_q
         };
     }
 
@@ -235,7 +260,8 @@ public:
         return {
             std::max(arch.num_sms / w.s_q, 1),
             5,
-            64
+            64,
+            w.h_q
         };
     }
 
@@ -277,7 +303,8 @@ public:
         return {
             std::max(arch.num_sms / w.s_q / 2, 1),
             3,
-            64
+            64,
+            w.h_q
         };
     }
 
@@ -596,7 +623,7 @@ sparse_attn_decode_interface(
     impl->run(params, features);
     
     CombineParams combine_params = {
-        b, s_q, h_q, d_v,
+        b, s_q, impl_meta.active_h_q, d_v,
 
         params.lse,
         params.out,
