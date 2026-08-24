@@ -1,4 +1,4 @@
-# FlashMLA Active-Head Optimization for vLLM
+# FlashMLA vLLM Optimization
 
 这是一个基于 DeepSeek FlashMLA 的实验性优化分支，面向 H200（SM90）上的
 GLM-5.2-FP8 和 DeepSeek-V4 sparse-decode 生产负载。它保留完整上游 Git 历史，
@@ -78,8 +78,8 @@ c725b63  splitkv skips padded-head epilogue stores
 必须递归检出固定的 CUTLASS 子模块：
 
 ```bash
-git clone --recursive <your-github-url> flashmla-active-head-optimization
-cd flashmla-active-head-optimization
+git clone --recursive <your-github-url> flashmla-vllm-optimization
+cd flashmla-vllm-optimization
 git submodule status
 ```
 
@@ -115,7 +115,7 @@ sha256sum flash_mla/_flashmla_C*.so
 docker build \
   --build-arg BASE_IMAGE='registry.h.pjlab.org.cn/ailab-pj-bw_gpu/yangxiaolei@sha256:c2f3b1b964e47809b722b5e75b61b1e7b39a50f70388cf2bf2418f16a9f31da2' \
   -f docker/Dockerfile.vllm \
-  -t vllm-v0271-flashmla-active-head:local \
+  -t flashmla-vllm-optimization:local \
   .
 ```
 

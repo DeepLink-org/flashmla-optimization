@@ -24,7 +24,7 @@ COPY --from=builder /opt/artifacts/_flashmla_C.abi3.so ${VLLM_FLASHMLA_PATH}
 
 RUN sha256sum ${VLLM_FLASHMLA_PATH}
 
-LABEL org.opencontainers.image.title="FlashMLA active-head optimized vLLM" \
+LABEL org.opencontainers.image.title="FlashMLA vLLM Optimization" \
       org.opencontainers.image.source="local-git-repository" \
       flashmla.upstream_commit="a8f794d1251cbfd88a5011445dd5582289c727e4" \
       flashmla.optimization="active-head-combine,small-split-combine,active-head-split-epilogue" \
