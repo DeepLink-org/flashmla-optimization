@@ -82,8 +82,8 @@ struct SharedMemoryPlan {
 };
 
 using TiledMMA_QK = decltype(make_tiled_mma(
-    GMMA::MMA_64x64x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
-    Layout<Shape<_1, _1, _1>>{}
+    GMMA::MMA_64x32x16_F32BF16BF16_SS<GMMA::Major::K, GMMA::Major::K>{},
+    Layout<Shape<_1, _2, _1>>{}
 ));
 
 using TiledMMA_PV_LocalP = decltype(make_tiled_mma(
@@ -105,10 +105,10 @@ struct TmaParams {
 };
 
 enum NamedBarriers : uint32_t {
-    wg0_bunch_0_ready = 0,
-    wg1_bunch_0_ready = 1,
-    wg0_s0_ready = 2,
-    wg1_s1_ready = 3,
+    softmax_max_ready = 0,
+    softmax_sum_ready = 1,
+    softmax_workspace_free = 2,
+    softmax_values_ready = 3,
     sL_ready = 4,
     warpgroup0_sync = 5,
     warpgroup1_sync = 6,

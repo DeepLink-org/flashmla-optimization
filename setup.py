@@ -117,7 +117,6 @@ ext_modules.append(
                 "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
                 "--expt-relaxed-constexpr",
                 "--expt-extended-lambda",
-                "--use_fast_math",
                 "--ptxas-options=-v,--register-usage-level=10,--warn-on-spills,--warn-on-local-memory-usage,--warn-on-double-precision-use",
                 "-lineinfo",
                 "--source-in-ptx",

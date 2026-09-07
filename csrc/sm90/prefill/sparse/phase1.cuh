@@ -93,11 +93,11 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             plan.bar_q.arrive_and_expect_tx(B_H*D_Q*sizeof(bf16));
         }
 
-        float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL}; // Meaning: the `max_logits` used for O / rL calculation
+        float rM[2] = {MAX_INIT_VAL, MAX_INIT_VAL};
         float rL[2] = {0.0f, 0.0f};
-        Tensor rO = partition_fragment_C(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<D_V/2>>{});
+        Tensor rO = partition_fragment_C(TiledMMA_PV_RemoteP{}, Shape<Int<B_H>, Int<D_V/2>>{});
         Tensor rP = partition_fragment_C(TiledMMA_QK{}, Shape<Int<B_H>, Int<B_TOPK>>{});
-        Tensor rS = make_tensor<bf16>(partition_shape_A(TiledMMA_PV_LocalP{}, Shape<Int<B_H>, Int<B_TOPK>>{}));
+        Tensor rS = make_fragment_like<bf16>(rP);
         cute::fill(rO, 0.0f);
         
         // Wait for Q
@@ -105,107 +105,109 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
 
         bool cur_bar_wait_phase = 0;
         
-        struct Warpgroup0 {};
-        struct Warpgroup1 {};
-
-        auto qkt_gemm_one_tile = [&](auto warpgroup_idx, int tile_idx, bool clear_accum) {
-            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+        auto qkt_gemm_one_tile = [&](int buffer_idx, int tile_idx, bool clear_accum) {
             TiledMMA tiled_mma_QK = TiledMMA_QK{};
             Tensor sQ_tile = flat_divide(sQ, Tile<Int<B_H>, Int<64>>{})(_, _, _0{}, tile_idx);
-            Tensor sK_tile = make_tensor(make_smem_ptr(plan.k[(int)IS_WG1].data() + tile_idx*B_TOPK*64), SmemLayoutKTiles<1>{});
-            gemm_ss(clear_accum, tiled_mma_QK, sQ_tile, sK_tile, rP, idx_in_warpgroup);
+            Tensor sK_tile = make_tensor(
+                make_smem_ptr(plan.k[buffer_idx].data() + tile_idx*B_TOPK*64),
+                SmemLayoutKTiles<1>{}
+            );
+            gemm_ss(clear_accum, tiled_mma_QK, sQ_tile, sK_tile, rP, threadIdx.x);
         };
 
-        auto mask_rP = [&](auto warpgroup_idx) {
-            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
-            plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
+        auto mask_rP = [&](int buffer_idx) {
             CUTE_UNROLL
             for (int row_idx = 0; row_idx < 2; ++row_idx) {
                 CUTE_UNROLL
                 for (int i = row_idx*2; i < size(rP); i += 4) {
-                    int col = 8*(i/4) + (idx_in_warpgroup%4)*2;
-                    if (!plan.is_kv_valid[IS_WG1][col]) rP(i) = -INFINITY;
-                    if (!plan.is_kv_valid[IS_WG1][col+1]) rP(i+1) = -INFINITY;
+                    int col = warpgroup_idx*32 + 8*(i/4) + (idx_in_warpgroup%4)*2;
+                    if (!plan.is_kv_valid[buffer_idx][col]) rP(i) = -INFINITY;
+                    if (!plan.is_kv_valid[buffer_idx][col+1]) rP(i+1) = -INFINITY;
                 }
             }
         };
 
-        auto online_softmax_and_rescale_o = [&](auto warpgroup_idx) {
-            plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
-            constexpr bool IS_WG1 = std::is_same_v<decltype(warpgroup_idx), Warpgroup1>;
+        auto online_softmax_and_rescale_o = [&](float *workspace) {
             const float scale = params.sm_scale_div_log2;
-            float r_sM[2];
-            if constexpr (IS_WG1) {
-                *(float2*)r_sM = plan.sM[idx_in_warpgroup/4];
-            }
-            float new_maxs[2];
+            float previous_sum[2] = {rL[0], rL[1]};
+            float local_max[2];
             CUTE_UNROLL
             for (int row_idx = 0; row_idx < 2; ++row_idx) {
-                // Get rowwise max
-                float cur_max = -INFINITY;
+                local_max[row_idx] = -INFINITY;
                 CUTE_UNROLL
                 for (int i = row_idx*2; i < size(rP); i += 4) {
-                    cur_max = max(cur_max, max(rP(i), rP(i+1)));
+                    local_max[row_idx] = max(local_max[row_idx], max(rP(i), rP(i+1)));
                 }
-                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 1));
-                cur_max = max(cur_max, __shfl_xor_sync(0xffffffff, cur_max, 2));
-                cur_max *= scale;
+                local_max[row_idx] = max(
+                    local_max[row_idx],
+                    __shfl_xor_sync(0xffffffff, local_max[row_idx], 1)
+                );
+                local_max[row_idx] = max(
+                    local_max[row_idx],
+                    __shfl_xor_sync(0xffffffff, local_max[row_idx], 2)
+                );
+            }
 
-                // Get new max and scale
-                // For WG1, old_max comes from sM (written by WG0); for WG0, old_max comes from rM (read by WG0 from sM in the last round)
-                new_maxs[row_idx] = max(IS_WG1 ? r_sM[row_idx] : rM[row_idx], cur_max);
+            if (idx_in_warpgroup%4 == 0) {
+                plan.sM[threadIdx.x/4] = *(float2*)local_max;
+            }
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(256, NamedBarriers::softmax_max_ready);
 
-                // Scale O
-                float scale_for_o = exp2f(rM[row_idx]-new_maxs[row_idx]);
-                CUTE_UNROLL
-                for (int i = row_idx*2; i < size(rO); i += 4) {
-                    rO(i) *= scale_for_o;
-                    rO(i+1) *= scale_for_o;
-                }
+            float alpha[2];
+            CUTE_UNROLL
+            for (int row_idx = 0; row_idx < 2; ++row_idx) {
+                float2 peer_max = plan.sM[(threadIdx.x/4)^32];
+                local_max[row_idx] = max(local_max[row_idx], row_idx == 0 ? peer_max.x : peer_max.y);
+                float previous_max = rM[row_idx];
+                rM[row_idx] = max(previous_max, local_max[row_idx]);
+                alpha[row_idx] = exp2f((previous_max-rM[row_idx])*scale);
 
-                // Get rS
-                float cur_sum = 0;
+                float local_sum = 0.0f;
                 CUTE_UNROLL
                 for (int i = row_idx*2; i < size(rP); i += 4) {
-                    rP(i) = exp2f(rP(i)*scale - new_maxs[row_idx]);
-                    rP(i+1) = exp2f(rP(i+1)*scale - new_maxs[row_idx]);
+                    rP(i) = exp2f(rP(i)*scale - rM[row_idx]*scale);
+                    rP(i+1) = exp2f(rP(i+1)*scale - rM[row_idx]*scale);
                     rS(i) = (bf16)rP(i);
                     rS(i+1) = (bf16)rP(i+1);
-                    cur_sum += rP(i) + rP(i+1);
                 }
-                rL[row_idx] = rL[row_idx]*scale_for_o + cur_sum;
+                CUTE_UNROLL
+                for (int i = row_idx*2; i < size(rP); i += 4) {
+                    local_sum += rP(i);
+                }
+                CUTE_UNROLL
+                for (int i = row_idx*2; i < size(rP); i += 4) {
+                    local_sum += rP(i+1);
+                }
+                workspace[row_idx*256 + threadIdx.x] = local_sum;
             }
-            __syncwarp();
-            if (idx_in_warpgroup%4 == 0) {
-                plan.sM[idx_in_warpgroup/4] = *(float2*)new_maxs;
-            }
-            rM[0] = new_maxs[0];
-            rM[1] = new_maxs[1];
-        };
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(256, NamedBarriers::softmax_sum_ready);
 
-        auto reduce_L = [&]() {
-            // Reduce L
-            // For example, thread 0 reduces with thread 1, 2, and 3, as well as thread 128, 129, 130, and 131
-            rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 1);
-            rL[0] += __shfl_xor_sync(0xffffffff, rL[0], 2);
-            rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 1);
-            rL[1] += __shfl_xor_sync(0xffffffff, rL[1], 2);
-            if (idx_in_warpgroup%4 == 0)
-                plan.sL[threadIdx.x/4] = *(float2*)(rL);
-            NamedBarrier::arrive_and_wait(256, NamedBarriers::sL_ready);
-            float2 peer_L = plan.sL[(threadIdx.x/4)^32];
-            rL[0] += peer_L.x;
-            rL[1] += peer_L.y;
+            CUTE_UNROLL
+            for (int row_idx = 0; row_idx < 2; ++row_idx) {
+                float tile_sum = workspace[row_idx*256 + threadIdx.x];
+                tile_sum += workspace[row_idx*256 + (threadIdx.x^128)];
+                tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 2);
+                tile_sum += __shfl_xor_sync(0xffffffff, tile_sum, 1);
+                rL[row_idx] = previous_sum[row_idx]*alpha[row_idx] + tile_sum;
+                CUTE_UNROLL
+                for (int i = row_idx*2; i < size(rO); i += 4) {
+                    rO(i) *= alpha[row_idx];
+                    rO(i+1) *= alpha[row_idx];
+                }
+            }
+            NamedBarrier::arrive_and_wait(256, NamedBarriers::softmax_workspace_free);
         };
 
         auto store_O = [&]() {
-            float scale_factors[2];
+            float normalizers[2];
             CUTE_UNROLL
             for (int i = 0; i < 2; ++i) {
                 float attn_sink = params.attn_sink == nullptr ? -CUDART_INF_F : params.attn_sink[q_h_idx*B_H + get_AorC_row_idx(i, idx_in_warpgroup)]*CUDART_L2E_F;
-                scale_factors[i] = 1.0f / (rL[i] + exp2f(attn_sink - rM[i]));
+                normalizers[i] = rL[i] + exp2f(attn_sink - rM[i]*params.sm_scale_div_log2);
                 if (rL[i] == 0.0f)
-                    scale_factors[i] = 0.0f;    // The output should be 0 whatever attn_sink is
+                    normalizers[i] = INFINITY;    // The output should be 0 whatever attn_sink is
             }
 
             Tensor sO = make_tensor(make_smem_ptr(plan.q_o.o.data() + warpgroup_idx*B_H*(D_V/2)), SmemLayoutOTiles<4>{});
@@ -225,7 +227,7 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 bf16 cur_rOb[NUM_ELEMS_EACH_TILE];
                 CUTE_UNROLL
                 for (int i = 0; i < NUM_ELEMS_EACH_TILE; ++i) {
-                    cur_rOb[i] = (bf16)(rO(tile_idx*NUM_ELEMS_EACH_TILE + i) * scale_factors[i%4>=2]);
+                    cur_rOb[i] = (bf16)(rO(tile_idx*NUM_ELEMS_EACH_TILE + i) / normalizers[i%4>=2]);
                 }
                 // R -> S
                 CUTE_UNROLL
@@ -255,210 +257,92 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
             cute::tma_store_arrive();
         };
 
-
-        if (warpgroup_idx == 0) {
-            // Warpgroup 0
-
-            auto pipelined_wait_and_qkt_gemm_l = [&]() __attribute__((always_inline)) {
+        auto process_tile = [&](int buffer_idx, auto const &sP) {
+            if (buffer_idx == 0) {
                 plan.bar_k0_ready[0].wait(cur_bar_wait_phase);
-                qkt_gemm_one_tile(Warpgroup0{}, 0, true);
-                qkt_gemm_one_tile(Warpgroup0{}, 1, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 2, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 3, false);
-                warpgroup_commit_batch();
-            };
-
-            auto pipelined_wait_and_qkt_gemm_r = [&]() __attribute__((always_inline)) {
-                plan.bar_k0_ready[1].wait(cur_bar_wait_phase);
-                qkt_gemm_one_tile(Warpgroup0{}, 4, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 5, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 6, false);
-                qkt_gemm_one_tile(Warpgroup0{}, 7, false);
-                if constexpr (D_QK == 576) {
-                    qkt_gemm_one_tile(Warpgroup0{}, 8, false);
-                }
-                warpgroup_commit_batch();
-            };
-
-            auto scale_rS = [&](float scales[2]) {
-                CUTE_UNROLL
-                for (int row = 0; row < 2; ++row) {
-                    CUTE_UNROLL
-                    for (int i = row*2; i < size(rP); i += 4) {
-                        rS(i) = (bf16)(rP(i) * scales[row]);
-                        rS(i+1) = (bf16)(rP(i+1) * scales[row]);
-                    }
-                }
-            };
-
-            auto rescale_rO = [&](float scales[2]) {
-                CUTE_UNROLL
-                for (int row = 0; row < 2; ++row) {
-                    CUTE_UNROLL
-                    for (int i = row*2; i < size(rO); i += 4) {
-                        rO(i) *= scales[row];
-                        rO(i+1) *= scales[row];
-                    }
-                    rL[row] *= scales[row];
-                }
-            };
-            
-            CUTE_NO_UNROLL
-            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
-                Tensor sV0l = make_tensor(make_smem_ptr(plan.k[0].data()), SmemLayoutKTilesTransposed<4>{});
-                Tensor sV1l = make_tensor(make_smem_ptr(plan.k[1].data()), SmemLayoutKTilesTransposed<4>{});
-
-                if (block_idx == 0) {
-                    // NOTE: We put this code here to avoid register spilling
-                    pipelined_wait_and_qkt_gemm_l();
-                    pipelined_wait_and_qkt_gemm_r();
-                    warpgroup_wait<0>();
-                }
-                
-                // Online softmax, inform WG1
-                mask_rP(Warpgroup0{});
-                
-                
-                online_softmax_and_rescale_o(Warpgroup0{});
-                NamedBarrier::arrive(256, NamedBarriers::wg0_bunch_0_ready);
-
-                // Issue rO0 += rS0 @ sV0l
-                gemm_rs(false, TiledMMA_PV_LocalP{}, rS, sV0l, rO, idx_in_warpgroup);
-                warpgroup_commit_batch();
-
-                // Mark V0L as free
-                warpgroup_wait<0>();
-                plan.bar_k0_free[0].arrive();
-
-                // Wait for new sM, scale rS, save, inform WG1
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_bunch_0_ready);
-                float new_rM[2], scale_factors[2];
-                *(float2*)new_rM = plan.sM[idx_in_warpgroup/4];
-                CUTE_UNROLL
-                for (int i = 0; i < 2; ++i) {
-                    scale_factors[i] = exp2f(rM[i] - new_rM[i]);
-                    rM[i] = new_rM[i];
-                }
-                scale_rS(scale_factors);
-                save_rS_to_sS(rS, sS0, idx_in_warpgroup);
-                fence_view_async_shared();
-                NamedBarrier::arrive(256, NamedBarriers::wg0_s0_ready);
-
-                // Wait for sS1
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg1_s1_ready);
-
-                // Rescale rO0, Issue rO0 += sS1 @ sV1L
-                rescale_rO(scale_factors);
-                gemm_ss(false, TiledMMA_PV_RemoteP{}, sS1, sV1l, rO, idx_in_warpgroup);
-                warpgroup_commit_batch();
-
-                cur_bar_wait_phase ^= 1;
-
-                if (block_idx+2 < num_topk_blocks) {
-                    // Launch the next QK^T GEMM
-                    pipelined_wait_and_qkt_gemm_l();
-
-                    // Mark V1L as free
-                    warpgroup_wait<1>();
-                    plan.bar_k1_free[0].arrive();
-                    pipelined_wait_and_qkt_gemm_r();
-
-                    // Wait for rP0 = sQ @ sK0
-                    warpgroup_wait<0>();
-                } else {
-                    // Mark V1L as free
-                    warpgroup_wait<0>();
-                    plan.bar_k1_free[0].arrive();
-                }
-            }
-
-            reduce_L();
-            store_O();
-        } else {
-            // Warpgroup 1
-
-            auto pipelined_wait_and_qkt_gemm = [&]() __attribute__((always_inline)) {
-                plan.bar_k1_ready[1].wait(cur_bar_wait_phase);
-                qkt_gemm_one_tile(Warpgroup1{}, 4, true);
-                qkt_gemm_one_tile(Warpgroup1{}, 5, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 6, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 7, false);
-                if constexpr (D_QK == 576) {
-                    qkt_gemm_one_tile(Warpgroup1{}, 8, false);
-                }
+            } else {
                 plan.bar_k1_ready[0].wait(cur_bar_wait_phase);
-                qkt_gemm_one_tile(Warpgroup1{}, 0, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 1, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 2, false);
-                qkt_gemm_one_tile(Warpgroup1{}, 3, false);
-                warpgroup_commit_batch();
-            };
-            
-            CUTE_NO_UNROLL
-            for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
-                Tensor sV0r = make_tensor(make_smem_ptr(plan.k[0].data()+64*256), SmemLayoutKTilesTransposed<4>{});
-                Tensor sV1r = make_tensor(make_smem_ptr(plan.k[1].data()+64*256), SmemLayoutKTilesTransposed<4>{});
-
-                // Issue rP1 = sQ @ sK1, and wait
-                pipelined_wait_and_qkt_gemm();
-                warpgroup_wait<0>();
-
-                mask_rP(Warpgroup1{});
-
-
-                // Wait for WG0 (for sM), online softmax, Notify WG0 (sM ready)
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_bunch_0_ready);
-                online_softmax_and_rescale_o(Warpgroup1{});
-                NamedBarrier::arrive(256, NamedBarriers::wg1_bunch_0_ready);
-
-
-                // Issue rO1 += rS1 @ sV1R
-                gemm_rs(false, TiledMMA_PV_LocalP{}, rS, sV1r, rO, idx_in_warpgroup);
-                warpgroup_commit_batch();
-                
-                // Wait for WG0 (for sS0), Issue rO1 += rS0 @ sV0R
-                save_rS_to_sS(rS, sS1, idx_in_warpgroup);   // Put it here is faster
-                NamedBarrier::arrive_and_wait(256, NamedBarriers::wg0_s0_ready);
-                gemm_ss(false, TiledMMA_PV_RemoteP{}, sS0, sV0r, rO, idx_in_warpgroup);
-                warpgroup_commit_batch();
-                
-                // Save rS1, inform WG0
-                fence_view_async_shared();
-                NamedBarrier::arrive(256, NamedBarriers::wg1_s1_ready);
-
-                // Wait for GEMM, and inform that sV1R is free
-                warpgroup_wait<1>();
-                plan.bar_k1_free[1].arrive();
-
-                // Wait for GEMM, and inform that sV0R is free
-                warpgroup_wait<0>();
-                plan.bar_k0_free[1].arrive();
-
-                cur_bar_wait_phase ^= 1;
             }
+            qkt_gemm_one_tile(buffer_idx, 0, true);
+            qkt_gemm_one_tile(buffer_idx, 1, false);
+            qkt_gemm_one_tile(buffer_idx, 2, false);
+            qkt_gemm_one_tile(buffer_idx, 3, false);
 
-            reduce_L();
-            store_O();
-
-            // Save lse
-            if (idx_in_warpgroup%4 == 0) {
-                for (int row = 0; row < 2; ++row) {
-                    int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
-                    bool is_no_valid_tokens = rL[row] == 0.0f;
-                    plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row]*CUDART_LN2_F;
-                    plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY : logf(rL[row]) + rM[row]*CUDART_LN2_F;
-                }
-                fence_view_async_shared();
+            if (buffer_idx == 0) {
+                plan.bar_k0_ready[1].wait(cur_bar_wait_phase);
+            } else {
+                plan.bar_k1_ready[1].wait(cur_bar_wait_phase);
             }
+            qkt_gemm_one_tile(buffer_idx, 4, false);
+            qkt_gemm_one_tile(buffer_idx, 5, false);
+            qkt_gemm_one_tile(buffer_idx, 6, false);
+            qkt_gemm_one_tile(buffer_idx, 7, false);
+            if constexpr (D_QK == 576) {
+                qkt_gemm_one_tile(buffer_idx, 8, false);
+            }
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
 
+            plan.bar_is_kv_valid_ready.wait(cur_bar_wait_phase);
+            mask_rP(buffer_idx);
+            float *softmax_workspace = buffer_idx == 0 ?
+                reinterpret_cast<float*>(plan.k[0].data() + 64*512) :
+                reinterpret_cast<float*>(plan.s[0].data());
+            online_softmax_and_rescale_o(softmax_workspace);
+
+            save_rS_to_sS(rS, sP, threadIdx.x);
+            fence_view_async_shared();
+            NamedBarrier::arrive_and_wait(256, NamedBarriers::softmax_values_ready);
+
+            Tensor sV = make_tensor(
+                make_smem_ptr(plan.k[buffer_idx].data() + warpgroup_idx*64*256),
+                SmemLayoutKTilesTransposed<4>{}
+            );
+            gemm_ss(false, TiledMMA_PV_RemoteP{}, sP, sV, rO, idx_in_warpgroup);
+            warpgroup_commit_batch();
+            warpgroup_wait<0>();
+
+            if (buffer_idx == 0) {
+                plan.bar_k0_free[warpgroup_idx].arrive();
+            } else {
+                plan.bar_k1_free[warpgroup_idx].arrive();
+            }
+        };
+
+        CUTE_NO_UNROLL
+        for (int block_idx = 0; block_idx < num_topk_blocks; block_idx += 2) {
+            process_tile(0, sS0);
+            process_tile(1, sS1);
+            cur_bar_wait_phase ^= 1;
+        }
+
+        store_O();
+
+        if (warpgroup_idx == 1 && idx_in_warpgroup%4 == 0) {
+            for (int row = 0; row < 2; ++row) {
+                int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
+                bool is_no_valid_tokens = rL[row] == 0.0f;
+                plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row]*params.sm_scale;
+                plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY :
+                    (log2f(rL[row]) + rM[row]*params.sm_scale_div_log2)*CUDART_LN2_F;
+            }
+            fence_view_async_shared();
+        }
+
+        if (warpgroup_idx == 1) {
             NamedBarrier::arrive_and_wait(128, NamedBarriers::warpgroup1_sync);
             if (idx_in_warpgroup == 0) {
                 int g_offset = s_q_idx*params.h_q + q_h_idx*B_H;
-                SM90_BULK_COPY_S2G::copy(plan.final_max_logits, params.max_logits + g_offset, B_H*sizeof(float));
+                SM90_BULK_COPY_S2G::copy(
+                    plan.final_max_logits,
+                    params.max_logits + g_offset,
+                    B_H*sizeof(float)
+                );
                 SM90_BULK_COPY_S2G::copy(plan.final_lse, params.lse + g_offset, B_H*sizeof(float));
                 cute::tma_store_arrive();
             }
         }
+
     } else {
         // Producer warpgroup
         cutlass::arch::warpgroup_reg_dealloc<72>();

@@ -1,5 +1,81 @@
 # FlashMLA
 
+## `precise-flashmla` 精度对齐分支
+
+本分支直接基于 DeepSeek FlashMLA 最新的 `upstream/main`（创建分支时为
+`15f13e5030374295491c5ce31b02d7e63a7772c6`），修复 H200 / SM90 sparse MLA
+prefill 前向与 TileLang 实现之间的数值偏差。它不包含本仓库私有 `main` 分支上的
+vLLM sparse-decode active-head 优化。
+
+### 改动内容
+
+| 项目 | 上游实现 | 本分支实现 |
+| --- | --- | --- |
+| QK 计算 | 两个 consumer warp group 各自使用 `64x64` WGMMA，独立推进不同的 token tile | 每个 warp group 使用 `64x32` WGMMA，两个 warp group 合作完成同一个 64-token tile |
+| Online softmax | 两个 warp group 按不同的 tile 顺序分别更新局部状态 | 每个 64-token tile 内跨 warp group 合并 max 和 sum，再统一更新 softmax 状态 |
+| PV 与输出 | 每个 warp group 独立消费自己的概率分块 | 两个 warp group 共享同一逻辑 tile 的概率，各自保留 256 个输出维度，合计写回 `d_v=512` |
+| 数学编译选项 | 全局使用 NVCC `--use_fast_math` | 移除 `--use_fast_math`，恢复精确的除法、平方根和次正规数处理；FMA 仍保持开启 |
+
+核心原则是让 FlashMLA 按照与 TileLang 相同的 **64-token 逻辑归约顺序** 更新
+online softmax，避免微小的前向误差在 cuDNN DSA backward 和端到端训练中被放大。
+CUDA kernel 接口没有变化，修改范围为：
+
+- `csrc/sm90/prefill/sparse/config.h`
+- `csrc/sm90/prefill/sparse/phase1.cuh`
+- `setup.py`
+
+在 GLM-5.2 训练 shape（Q `[16384, 64, 576]`、KV `[16384, 1, 576]`、
+top-k 2048）上，修复后的 FlashMLA 与 TileLang 对比结果为：输出逐比特一致，LSE
+最大绝对误差 `9.536743e-7`。本次修复只改变 sparse MLA forward；训练中 backward
+仍由调用方选择，例如 XTuner 当前使用 cuDNN DSA backward。
+
+### H200 / CUDA 12.8 编译
+
+```bash
+git switch precise-flashmla
+git submodule update --init --recursive
+
+FLASH_MLA_DISABLE_SM100=1 \
+MAX_JOBS=8 \
+NVCC_THREADS=2 \
+python3 setup.py build_ext --inplace
+```
+
+也可以安装到当前 Python 环境：
+
+```bash
+FLASH_MLA_DISABLE_SM100=1 \
+MAX_JOBS=8 \
+NVCC_THREADS=2 \
+python3 -m pip install -v --no-build-isolation .
+```
+
+CUDA 12.8 必须设置 `FLASH_MLA_DISABLE_SM100=1`；SM100 需要 CUDA 12.9 或更新版本，
+并且不在本次精度与性能验证范围内。
+
+### 使用与验证
+
+Python 调用方式与上游完全一致：
+
+```python
+from flash_mla import flash_mla_sparse_fwd
+
+out, max_logits, lse = flash_mla_sparse_fwd(q, kv, indices, sm_scale)
+```
+
+源码目录内编译后，可运行上游 sparse-prefill 测试：
+
+```bash
+python3 tests/test_flash_mla_sparse_prefill.py
+```
+
+调用方若此前已经安装过其他 FlashMLA，请确认实际加载的是本分支生成的扩展，避免
+源码与 `.so` 混用：
+
+```bash
+python3 -c 'import flash_mla.cuda as m; print(m.__file__)'
+```
+
 ## Introduction
 
 FlashMLA is DeepSeek's library of optimized attention kernels, powering the [DeepSeek-V3](https://github.com/deepseek-ai/DeepSeek-V3) and [DeepSeek-V3.2-Exp](https://github.com/deepseek-ai/DeepSeek-V3.2-Exp) models. This repository contains the following implementations:
