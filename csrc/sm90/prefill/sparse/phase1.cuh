@@ -323,8 +323,11 @@ __device__ void KernelTemplate<D_QK, HAVE_TOPK_LENGTH>::devfunc(const SparseAttn
                 int real_row = get_AorC_row_idx(row, idx_in_warpgroup);
                 bool is_no_valid_tokens = rL[row] == 0.0f;
                 plan.final_max_logits[real_row] = is_no_valid_tokens ? -INFINITY : rM[row]*params.sm_scale;
+                // Match TileLang's separate FP32 multiply/add rounding for
+                // log2 LSE, then convert to natural log without contracting FMA.
                 plan.final_lse[real_row] = is_no_valid_tokens ? +INFINITY :
-                    (log2f(rL[row]) + rM[row]*params.sm_scale_div_log2)*CUDART_LN2_F;
+                    __fmul_rn(__fadd_rn(log2f(rL[row]),
+                        __fmul_rn(rM[row], params.sm_scale_div_log2)), CUDART_LN2_F);
             }
             fence_view_async_shared();
         }
